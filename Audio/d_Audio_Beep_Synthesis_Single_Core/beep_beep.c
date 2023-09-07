@@ -73,9 +73,34 @@ fix15 current_amplitude_1 = 0 ;         // current amplitude (modified in ISR)
 #define BEEP_DURATION           10400
 #define BEEP_REPEAT_INTERVAL    40000
 
+// Timing params for swoop (units of interrupts)
+#define SWOOP_ATTACK_TIME 1000
+#define SWOOP_DECAY_TIME  1000
+#define SWOOP_LENGTH      5200
+
+#define CHIRP_ATTACK_TIME 1000
+#define CHIRP_DECAY_TIME  1000
+#define CHIRP_LENGTH      5200
+
+fix15 swoop[SWOOP_LENGTH] = {0}; // holds the swoop audio samples
+fix15 swoop_attack_inc ;         // rate at which sound ramps up
+fix15 swoop_decay_inc ;          // rate at which sound ramps down
+fix15 chirp[CHIRP_LENGTH] = {0};
+fix15 chirp_attack_inc ;         // rate at which sound ramps up
+fix15 chirp_decay_inc ;          // rate at which sound ramps down
+
 // State machine variables
+// beep
 volatile unsigned int STATE_0 = 0 ;
 volatile unsigned int count_0 = 0 ;
+
+// swoop
+volatile unsigned int STATE_1 = 0;
+volatile unsigned int count_1 = 0;
+
+// chirp
+volatile unsigned int STATE_2 = 0;
+volatile unsigned int count_2 = 0;
 
 // SPI data
 uint16_t DAC_data_1 ; // output value
@@ -109,8 +134,11 @@ volatile int global_counter = 0 ;
 #define DB_MAYBE_UNPRESSED 3
 volatile unsigned int DB_STATE = DB_UNPRESSED;
 volatile unsigned int BEEP_FLAG = 0;
+volatile unsigned int CHIRP_FLAG = 0;
+volatile unsigned int SWOOP_FLAG = 0;
 static int keycode ;
 static int possible ;
+
 
 // // ----------Keypad------------- //
 // // VGA graphics library
@@ -138,10 +166,15 @@ int prev_key = 0;
 // function PTs
 void debouncing_fsm();
 static int scan_keypad();
+void calculate_swoop();
+void calculate_chirp();
 
 
 // This timer ISR is called on core 0
 bool repeating_timer_callback_core_0(struct repeating_timer *t) {
+    // set gpio at beginning of interrupt 
+    gpio_put(16, 1);
+
     // BEEP
     if (BEEP_FLAG) {
 
@@ -190,6 +223,74 @@ bool repeating_timer_callback_core_0(struct repeating_timer *t) {
         // retrieve core number of execution
         corenum_0 = get_core_num() ;
     }
+
+    if (SWOOP_FLAG) {
+        if (STATE_1 == 0) {
+
+            // Mask with DAC control bits
+            DAC_data_0 = (DAC_config_chan_B | ((fix2int15(swoop[count_1]) + 2048) & 0xffff))  ;
+            DAC_data_1 = (DAC_config_chan_B | ((fix2int15(swoop[count_1]) + 2048) & 0xffff))  ;
+
+            // SPI write (no spinlock b/c of SPI buffer)
+            spi_write16_blocking(SPI_PORT, &DAC_data_0, 1) ;
+            spi_write16_blocking(SPI_PORT, &DAC_data_1, 1) ;
+
+            // Increment the counter
+            count_1 += 1 ;
+
+            // State transition?
+            if (count_1 == SWOOP_LENGTH) {
+                STATE_1 = 1 ;
+                count_1 = 0 ;
+            }
+        }
+        // State transition?
+        else {
+            current_amplitude_0 = 0 ;
+            STATE_1 = 0 ;
+            count_1 = 0 ;
+            SWOOP_FLAG = 0;
+
+        }
+
+        // retrieve core number of execution
+        corenum_0 = get_core_num() ;
+    }
+
+    if (CHIRP_FLAG) {
+        if (STATE_2 == 0) {
+
+            // Mask with DAC control bits
+            DAC_data_0 = (DAC_config_chan_B | ((fix2int15(chirp[count_2]) + 2048) & 0xffff))  ;
+            DAC_data_1 = (DAC_config_chan_B | ((fix2int15(chirp[count_2]) + 2048) & 0xffff))  ;
+
+            // SPI write (no spinlock b/c of SPI buffer)
+            spi_write16_blocking(SPI_PORT, &DAC_data_0, 1) ;
+            spi_write16_blocking(SPI_PORT, &DAC_data_1, 1) ;
+
+            // Increment the counter
+            count_2 += 1 ;
+
+            // State transition?
+            if (count_2 == CHIRP_LENGTH) {
+                STATE_2 = 1 ;
+                count_2 = 0 ;
+            }
+        }
+        // State transition?
+        else {
+            STATE_2 = 0 ;
+            count_2 = 0 ;
+            CHIRP_FLAG = 0;
+
+        }
+
+        // retrieve core number of execution
+        corenum_0 = get_core_num() ;
+    }
+    // unset gpio at beginning of interrupt 
+    gpio_put(16, 0);
+
     return true;
 }
 
@@ -221,6 +322,52 @@ static PT_THREAD (protothread_core_0(struct pt *pt))
     // Indicate thread end
     PT_END(pt) ;
 }
+
+
+void calculate_swoop(){
+    static unsigned int DDS_phase = 0;
+    static float frequency;
+    static unsigned int DDS_increment;
+    fix15 amplitude = 0;
+
+    for (int i = 0; i < SWOOP_LENGTH; i++) {
+        if (i < SWOOP_ATTACK_TIME) {
+            amplitude = amplitude + swoop_attack_inc;
+        }
+        else if (i > SWOOP_LENGTH - SWOOP_DECAY_TIME) {
+            amplitude = amplitude - swoop_decay_inc;
+        }
+        
+        frequency = -260.0 * sin( (-M_PI / SWOOP_LENGTH) * i ) + 1740;
+        DDS_increment = frequency*two32/Fs;
+        DDS_phase += DDS_increment;
+        swoop[i] = multfix15(sin_table[DDS_phase >> 24], amplitude);
+    }
+
+}
+
+void calculate_chirp(){
+    static unsigned int chirp_DDS_phase = 0;
+    static float chirp_frequency;
+    static unsigned int chirp_DDS_increment;
+    fix15 chirp_amplitude = 0;
+
+    for (int i = 0; i < CHIRP_LENGTH; i++) {
+        if (i < CHIRP_ATTACK_TIME) {
+            chirp_amplitude = chirp_amplitude + chirp_attack_inc;
+        }
+        else if (i > CHIRP_LENGTH - CHIRP_DECAY_TIME) {
+            chirp_amplitude = chirp_amplitude - chirp_decay_inc;
+        }
+        
+        chirp_frequency = (1.84 * pow(10,-4)) * (i*i) + 2000;
+        chirp_DDS_increment = chirp_frequency*two32/Fs;
+        chirp_DDS_phase += chirp_DDS_increment;
+        chirp[i] = multfix15(sin_table[chirp_DDS_phase >> 24], chirp_amplitude);
+    }
+
+}
+
 
 // This function scans the keypad and returns if there is a valid press.
 // returns -1 for invalid, and the index of the valid keycode if valid. 
@@ -287,8 +434,15 @@ void debouncing_fsm(){
 
         case DB_MAYBE:
             if (keycode == possible){
-                // beep
-                BEEP_FLAG = 1;
+                if (keycode == 1){
+                    SWOOP_FLAG = 1;
+                }
+                else if (keycode == 2){
+                    CHIRP_FLAG = 1;
+                }
+                else {
+                    BEEP_FLAG = 1;
+                }
                 DB_STATE = DB_PRESSED;
             }
             else {
@@ -338,9 +492,20 @@ int main() {
     gpio_set_dir(LED, GPIO_OUT) ;
     gpio_put(LED, 0) ;
 
+    // Interrupt GPIO
+    gpio_init(16);
+    gpio_set_dir(16, GPIO_OUT);
+    gpio_put(16, 0);
+
+
     // set up increments for calculating bow envelope
     attack_inc = divfix(max_amplitude, int2fix15(ATTACK_TIME)) ;
     decay_inc =  divfix(max_amplitude, int2fix15(DECAY_TIME)) ;
+
+    swoop_attack_inc = divfix(max_amplitude, int2fix15(SWOOP_ATTACK_TIME)) ;
+    swoop_decay_inc =  divfix(max_amplitude, int2fix15(SWOOP_DECAY_TIME)) ;
+    chirp_attack_inc = divfix(max_amplitude, int2fix15(SWOOP_ATTACK_TIME)) ;
+    chirp_decay_inc =  divfix(max_amplitude, int2fix15(SWOOP_DECAY_TIME)) ;
 
     // Build the sine lookup table
     // scaled to produce values between 0 and 4096 (for 12-bit DAC)
@@ -348,6 +513,10 @@ int main() {
     for (ii = 0; ii < sine_table_size; ii++){
          sin_table[ii] = float2fix15(2047*sin((float)ii*6.283/(float)sine_table_size));
     }
+
+    // create swoop + chirp
+    calculate_swoop();
+    calculate_chirp();
 
     // Create a repeating timer that calls 
     // repeating_timer_callback (defaults core 0)
